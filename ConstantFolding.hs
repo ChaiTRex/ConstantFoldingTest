@@ -1,19 +1,28 @@
 {-# OPTIONS_GHC -O0 #-}
 {-# LANGUAGE BangPatterns, Strict, TemplateHaskell #-}
 
+-- To use all CPU threads, compile with `ghc-stage2 -threaded -with-rtsopts=-N`.
+
 module Main (main) where
 
-import Control.Exception (bracket)
-import Control.Monad     (forM_, replicateM)
-import Data.List         (foldl')
-import Data.Int          (Int8)
-import System.Directory  (getTemporaryDirectory, removeFile)
-import System.IO         ( Handle
-                         , SeekMode(AbsoluteSeek)
-                         , hClose, hFlush, hPutStr, hSeek, hSetFileSize
-                         , openTempFile
-                         )
-import ThisGHC           (runHaskellFile)
+import Control.Concurrent      (forkFinally, forkIO, getNumCapabilities)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.Chan ( Chan, newChan, readChan, writeChan
+                               , writeList2Chan
+                               )
+import Control.DeepSeq         (force)
+import Control.Exception       (bracket)
+import Control.Monad           (forM, forM_, replicateM)
+import Data.List               (foldl')
+import Data.Int                (Int8)
+import Data.Typeable           (typeOf)
+import System.Directory        (getTemporaryDirectory, removeFile)
+import System.IO               ( Handle, hClose, hFlush, hPutStr, hSeek
+                                       , hSetFileSize
+                               , SeekMode(AbsoluteSeek)
+                               , openTempFile
+                               )
+import ThisGHC                 (runHaskellFile)
 
 -- ++======================================================================++ --
 -- || Configuration section                                                || --
@@ -31,17 +40,14 @@ maxNestingDepth :: Int
 {-# INLINE maxNestingDepth #-}
 maxNestingDepth = 2
 
--- This tester creates a temporary .hs file to run the tests from. Putting all
+-- This tester creates temporary .hs files to run the tests from. Putting all
 -- tests in at once can lead to a GHC heap overflow failure. This many tests are
 -- put in the temporary .hs file per testing iteration.
 iterationTests :: Int
 {-# INLINE iterationTests #-}
-iterationTests = 4000
+iterationTests = 200
 
 -- The type of values we're dealing with.
-valueStr :: String
-{-# NOINLINE valueStr #-}
-valueStr   = "Int"
 type Value =  Int
 
 -- Literal and variable values to test.
@@ -281,6 +287,10 @@ exprs = concatMap go . exprTs
 
 -- == Tests == --
 
+valueStr :: String
+{-# NOINLINE valueStr #-}
+valueStr   = show (typeOf (undefined :: Value))
+
 tests :: Int -> [String]
 {-# INLINE tests #-}
 tests = map go
@@ -315,6 +325,7 @@ tests = map go
     testParts fn e =
       let expr = show e
           vars = varCount e
+-- ZOMG
           hashResult = hash (eval e <$> replicateM vars values)
       in ( unlines [ fn ++ " :: [" ++ valueStr ++ "] -> " ++ valueStr
                    , "{-# NOINLINE " ++ fn ++ " #-}"
@@ -323,8 +334,8 @@ tests = map go
                    ]
          , unlines [ "  if hash (" ++ fn ++ " <$> replicateM " ++ show vars
                        ++ " xs) == " ++ show hashResult
-                   , "         then return ()"
-                   , "         else putStrLn \"ERROR! " ++ expr
+                   , "     then return ()"
+                   , "     else putStrLn \"ERROR! " ++ expr
                        ++ " is optimized incorrectly!\""
                    , ""
                    ]
@@ -354,19 +365,38 @@ tests = map go
                              , concatMap snd xs
                              ]
 
-withTemporaryHaskellFile :: (FilePath -> Handle -> IO a) -> IO a
-{-# INLINE withTemporaryHaskellFile #-}
-withTemporaryHaskellFile act = do
-  bracket
-    (do
-      tmpdir <- getTemporaryDirectory
-      openTempFile tmpdir "GHCConstantFoldingTest.hs"
-    )
-    (\ (path, hnd) -> do
-      hClose hnd
-      removeFile path
-    )
-    (uncurry act)
+onAllCapabilities_ :: [a] -> (IO b) -> (b -> a -> IO c) -> (b -> IO d) -> IO ()
+onAllCapabilities_ jobInputs setup workOneJob teardown = do
+  threadCount <- getNumCapabilities
+  workNeeded  <- newChan
+  workQueue   <- newChan
+  let (initInputs, jobInputs') = splitAt threadCount $ map Just jobInputs
+  waiters     <- forM initInputs $ \ workItem -> do
+    writeChan workQueue workItem
+    waiter <- newEmptyMVar
+    forkIO $
+       bracket setup
+               (\ setupItem -> do
+                  teardown setupItem
+                  putMVar waiter ()
+               )
+               (worker workNeeded workQueue workOneJob)
+    return waiter
+  forM_ jobInputs' $ \ workItem -> do
+    readChan workNeeded
+    writeChan workQueue workItem
+  writeChan workQueue Nothing
+  mapM_ takeMVar waiters
+  where
+    worker :: Chan () -> Chan (Maybe a) -> (b -> a -> IO c) -> b -> IO ()
+    worker workNeeded workQueue workOneJob setupItem = do
+      workOrStop <- readChan workQueue
+      case workOrStop of
+           Nothing       -> writeChan workQueue workOrStop
+           Just workItem -> do
+                writeChan workNeeded ()
+                workOneJob setupItem workItem
+                worker workNeeded workQueue workOneJob setupItem
 
 overwriteHandle :: Handle -> String -> IO ()
 {-# INLINE overwriteHandle #-}
@@ -377,10 +407,20 @@ overwriteHandle hnd str = do
   hFlush       hnd
 
 main :: IO ()
-main = withTemporaryHaskellFile $ \ path hnd -> do
-  forM_ (tests maxNestingDepth) $ \ src -> do
-    overwriteHandle hnd src
-    $( runHaskellFile ) path
+main = do
+  onAllCapabilities_ (map force (tests maxNestingDepth))
+                     (do
+                        tmpDir <- getTemporaryDirectory
+                        openTempFile tmpDir "GHCConstantFoldingTest.hs"
+                     )
+                     (\ (path, hnd) src -> do
+                        overwriteHandle hnd src
+                        $( runHaskellFile ) path
+                     )
+                     (\ (path, hnd) -> do
+                        hClose hnd
+                        removeFile path
+                     )
 
 
 -- == Debugging == --
